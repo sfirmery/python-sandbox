@@ -17,20 +17,20 @@ sock.settimeout(.2)
 
 # send data many times
 while 1:
-  # send data to multicast group
-  sock.sendto(MESSAGE, (MCAST_GRP, UDP_PORT))
+    # send data to multicast group
+    sock.sendto(MESSAGE, (MCAST_GRP, UDP_PORT))
 
-  print "send message:", MESSAGE, "to:", MCAST_GRP
-  print "waiting reply..."
+    print "send message:", MESSAGE, "to:", MCAST_GRP
+    print "waiting reply..."
 
-  # listen reply
-  while 1:
-    try:
-      data, addr = sock.recvfrom(12)
-    except socket.timeout:
-      print 'timed out, no more responses'
-      break
-    else:
-      print "received message:", data, "from:", addr
+    # listen reply
+    while 1:
+        try:
+            data, addr = sock.recvfrom(12)
+        except socket.timeout:
+            print 'timed out, no more responses'
+            break
+        else:
+            print "received message:", data, "from:", addr
 
-  time.sleep(1)
+        time.sleep(1)
