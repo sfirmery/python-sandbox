@@ -25,6 +25,6 @@ sock.setsockopt(socket.SOL_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(MCAST_
 
 while 1:
     data, addr = sock.recvfrom(1024)
-    print "received message:", data, "from:", addr
+    print "received message:", repr(data), "from:", repr(addr)
 
     sock.sendto("Re:" + data, addr)

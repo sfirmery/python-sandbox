@@ -6,10 +6,18 @@ TCP_PORT = 9000
 
 class EchoHandler(asyncore.dispatcher_with_send):
 
+    def handle_write(self):
+        print "handle_write()"
+
     def handle_read(self):
         data = self.recv(8192)
         if data:
+            print "received message:", repr(data)
             self.send("OK")
+
+    def handle_close(self):
+        print "Connection closed."
+        self.close()
 
 class TCPEchoServer(asyncore.dispatcher):
 
