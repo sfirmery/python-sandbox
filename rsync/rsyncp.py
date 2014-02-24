@@ -6,7 +6,6 @@ import os
 import logging
 from subprocess import Popen
 from subprocess import PIPE
-from StringIO import StringIO
 
 MAXPATHLEN = 1024
 
@@ -41,6 +40,7 @@ logger = logging.getLogger('rsyncp')
 
 # define logging level
 # logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 if hasattr(logging, 'captureWarnings'):
     # New in Python 2.7
@@ -49,7 +49,7 @@ if hasattr(logging, 'captureWarnings'):
 # define logging handler
 console_handler = logging.StreamHandler()
 # console_handler.setLevel(logging.DEBUG)
-console_format = '%(asctime)s - %(name)s %(funcName)s(): %(levelname)s %(message)s'
+console_format = '%(asctime)s - %(name)s:%(lineno)d(%(funcName)s): %(levelname)s %(message)s'
 console_formatter = logging.Formatter(console_format, '%b %d %H:%M:%S')
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
@@ -71,7 +71,6 @@ class RsyncP:
         self.remote_dir = [
             # './test_dir',
             '../../cfengine/.git',
-            # '/Users/sylvain/',
             # '/dev/random',
         ]
 
@@ -190,6 +189,7 @@ class RsyncP:
 
     def terminate(self):
         """terminate rsync process"""
+        logger.info('number of files: %s', len(self.file_list.files))
         for file_entry in self.file_list.files:
             logger.debug('file: %r', file_entry)
         self.rsync_fd.terminate()
@@ -213,8 +213,6 @@ class FileList:
 
     def __init__(self, rsync_fd):
         self.rsync_fd = rsync_fd
-        self.data_chunk = StringIO()
-        self.data_chunk_buffer = ''
         self.chunk_len = 0
 
     def _read_byte(self):
@@ -250,14 +248,23 @@ class FileList:
 
     def _read_buff(self, length):
         """read length from buffer string"""
+        logger.debug('need %s bytes from buffer', length)
         if self.chunk_len < length:
+            read_data = self._read_rsync_buff(self.chunk_len)
             logger.debug('need %s more bytes (%s)',
                          length - self.chunk_len, self.chunk_len)
-            self._read_chunk(length)
-        self.chunk_len = self.chunk_len - length
-        logger.debug('reading %s bytes of %s from buffer',
-                     length, self.chunk_len)
-        return self.data_chunk.read(length)
+            while self.chunk_len < length:
+                logger.debug('read chunk')
+                self._read_chunk()
+            self.chunk_len = self.chunk_len - length + len(read_data)
+            logger.debug('reading %s bytes of %s from buffer',
+                         length, self.chunk_len)
+            return read_data + self._read_rsync_buff(length - len(read_data))
+        else:
+            self.chunk_len = self.chunk_len - length
+            logger.debug('reading %s bytes of %s from buffer',
+                         length, self.chunk_len)
+            return self._read_rsync_buff(length)
 
     def _read_rsync_buff(self, length):
         """read length from buffer string"""
@@ -266,30 +273,26 @@ class FileList:
 
     def _read_chunk(self, length=1):
         """read chunk of data"""
-        while self.chunk_len < length:
-            read_data = self._read_rsync_buff(4)
-            if not read_data:
-                logger.debug('_read_chunk: no data')
-                return -1
-            data = struct.unpack('I', read_data)[0]
-            code = (data >> 24) - 7
-            logger.debug('code: %r', code)
-            length = data & 0xffffff
-            logger.debug('len: %r', length)
-            read_data = self._read_rsync_buff(length)
+        read_data = self._read_rsync_buff(4)
+        if not read_data:
+            logger.debug('_read_chunk: no data')
+            return -1
+        data = struct.unpack('I', read_data)[0]
+        code = (data >> 24) - 7
+        logger.debug('code: %r', code)
+        length = data & 0xffffff
+        logger.debug('len: %r', length)
 
-            if code == 0:
-                read_data = self.data_chunk.read(self.chunk_len) + read_data
-                self.chunk_len = len(read_data)
-                self.data_chunk.close()
-                self.data_chunk = StringIO(read_data)
-                logger.debug('length of data_chunk: %r', len(read_data))
-                # print 'data_chunk: %r' % self.data_chunk
-            else:
-                read_data = read_data.rstrip('\n\r')
-                logger.debug('read_data: %r', read_data)
-                if code == 1 or read_data.rfind('file has vanished:'):
-                    self.error_count = self.error_count + 1
+        if code == 0:
+            self.chunk_len = length
+            logger.debug('length of data_chunk: %r', len(read_data))
+            # print 'data_chunk: %r' % self.data_chunk
+        else:
+            read_data = self._read_rsync_buff(length)
+            read_data = read_data.rstrip('\n\r')
+            logger.error('%s (%s)', read_data, code)
+            if code == 1 or read_data.rfind('file has vanished:'):
+                self.error_count = self.error_count + 1
 
     @classmethod
     def _from_wire_mode(cls, mode):
@@ -579,12 +582,12 @@ class File:
             (self.name, self.uid, self.gid, self.mode, self.mtime, self.size)
 
 if __name__ == "__main__":
-    import cProfile
+    # import cProfile
     # import resource
     # print resource.getrusage(resource.RUSAGE_SELF)
     rsyncp = RsyncP()
     rsyncp.remote_start()
-    cProfile.run('rsyncp.received_file_list()')
+    rsyncp.received_file_list()
+    # cProfile.run('rsyncp.received_file_list()')
     rsyncp.terminate()
     # print resource.getrusage(resource.RUSAGE_SELF)
-
