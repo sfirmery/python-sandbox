@@ -6,6 +6,7 @@ import os
 import logging
 from subprocess import Popen
 from subprocess import PIPE
+from StringIO import StringIO
 
 MAXPATHLEN = 1024
 
@@ -39,8 +40,8 @@ BLOCKSUM_BIAS = 10
 logger = logging.getLogger('rsyncp')
 
 # define logging level
-# logger.setLevel(logging.DEBUG)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+# logger.setLevel(logging.INFO)
 
 if hasattr(logging, 'captureWarnings'):
     # New in Python 2.7
@@ -57,20 +58,24 @@ logger.addHandler(console_handler)
 
 class RsyncP:
     """Rsync protocol"""
-
     file_list = ''
     rsync_fd = ''
-    data_chunk = ''
 
     protocol_version = 28
 
     def __init__(self, remote_send=True):
+        self.chunk_data = StringIO()
+        self.chunk_len = 0
+        self.error_count = 0
+
         logger.info('Initialising RsyncP')
         self.rsync_cmd = '/usr/bin/rsync'
         self.remote_cmd = [self.rsync_cmd]
         self.remote_dir = [
             # './test_dir',
-            '../../cfengine/.git',
+            # './test_dir/dir1/subdir4567/145file1',
+            # '../../cfengine/.git',
+            '/Users/sylvain',
             # '/dev/random',
         ]
 
@@ -92,7 +97,7 @@ class RsyncP:
             'copy-links': False,
             'hard-links': True,
             'ignore-times': False,
-            'block-size': 700,
+            'block-size': 512,
             'relative': False,
             'recursive': True,
             'verbose': True,
@@ -100,6 +105,8 @@ class RsyncP:
             'protect-args': False,
             # "-re.iLsf", ".",
             'filter': False,
+            'checksum': True,
+            'checksum-seed': 75842745, # struct.unpack('I', open("/dev/urandom","rb").read(4))
         }
 
         for arg, value in self.rsync_args.iteritems():
@@ -142,6 +149,32 @@ class RsyncP:
         logger.debug('readin %s bytes', length)
         return self.rsync_fd.stdout.read(length)
 
+    def _read_chunk(self, length=1):
+        """read chunk of data"""
+        while self.chunk_len < length:
+            read_data = self._read_buff(4)
+            if not read_data:
+                logger.debug('_read_chunk: no data')
+                return -1
+            data = struct.unpack('I', read_data)[0]
+            code = (data >> 24) - 7
+            logger.debug('code: %r', code)
+            length = data & 0xffffff
+            logger.debug('len: %r', length)
+            read_data = self._read_buff(length)
+            if code == 0:
+                read_data = self.chunk_data.read(self.chunk_len) + read_data
+                self.chunk_len = self.chunk_len + length
+                self.chunk_data.close()
+                self.chunk_data = StringIO(read_data)
+                logger.debug('length of chunk_data: %r', len(read_data))
+                # print 'chunk_data: %r' % self.chunk_data
+            else:
+                read_data = read_data.rstrip('\n\r')
+                logger.error('%s (%s)', read_data, code)
+                if code == 1 or read_data.rfind('file has vanished:'):
+                    self.error_count = self.error_count + 1
+
     def remote_start(self):
         """start remote rsync"""
         logger.info('Running: %r', self.remote_cmd)
@@ -164,6 +197,19 @@ class RsyncP:
         logger.debug('read_data: %r', read_data)
         checksum_seed = struct.unpack('I', read_data)[0]
         logger.debug('checksum seed: %r', checksum_seed)
+
+    def sync(self):
+        """sync with remote"""
+
+        self.received_file_list()
+
+        #
+
+        # get file delta
+        read_data = self._read_chunk(4)
+        logger.debug('read_data: %r', read_data)
+        file_num = struct.unpack('I', self.chunk_data)[0]
+        logger.debug('file_num: %r', file_num)
 
     def received_file_list(self):
         """received and parse file list from rsync"""
@@ -213,7 +259,9 @@ class FileList:
 
     def __init__(self, rsync_fd):
         self.rsync_fd = rsync_fd
+        self.chunk_data = StringIO()
         self.chunk_len = 0
+        self.flags = 0
 
     def _read_byte(self):
         """read byte from buffer string"""
@@ -238,33 +286,17 @@ class FileList:
         ret = struct.unpack('Q', read_data)[0]
         return ret
 
-    def _read_flags(self):
-        """read flags from buffer"""
-        flags = self._read_byte()
-        if self.protocol_version >= 28 and (flags & XMIT_EXTENDED_FLAGS):
-            flags = flags | (self._read_byte() << 8)
-        logger.debug('flags: %r', flags)
-        return flags
-
     def _read_buff(self, length):
         """read length from buffer string"""
         logger.debug('need %s bytes from buffer', length)
         if self.chunk_len < length:
-            read_data = self._read_rsync_buff(self.chunk_len)
             logger.debug('need %s more bytes (%s)',
                          length - self.chunk_len, self.chunk_len)
-            while self.chunk_len < length:
-                logger.debug('read chunk')
-                self._read_chunk()
-            self.chunk_len = self.chunk_len - length + len(read_data)
-            logger.debug('reading %s bytes of %s from buffer',
-                         length, self.chunk_len)
-            return read_data + self._read_rsync_buff(length - len(read_data))
-        else:
-            self.chunk_len = self.chunk_len - length
-            logger.debug('reading %s bytes of %s from buffer',
-                         length, self.chunk_len)
-            return self._read_rsync_buff(length)
+            self._read_chunk(length)
+        logger.debug('reading %s bytes of %s from buffer',
+                     length, self.chunk_len)
+        self.chunk_len = self.chunk_len - length
+        return self.chunk_data.read(length)
 
     def _read_rsync_buff(self, length):
         """read length from buffer string"""
@@ -273,26 +305,29 @@ class FileList:
 
     def _read_chunk(self, length=1):
         """read chunk of data"""
-        read_data = self._read_rsync_buff(4)
-        if not read_data:
-            logger.debug('_read_chunk: no data')
-            return -1
-        data = struct.unpack('I', read_data)[0]
-        code = (data >> 24) - 7
-        logger.debug('code: %r', code)
-        length = data & 0xffffff
-        logger.debug('len: %r', length)
-
-        if code == 0:
-            self.chunk_len = length
-            logger.debug('length of data_chunk: %r', len(read_data))
-            # print 'data_chunk: %r' % self.data_chunk
-        else:
+        while self.chunk_len < length:
+            read_data = self._read_rsync_buff(4)
+            if not read_data:
+                logger.debug('_read_chunk: no data')
+                return -1
+            data = struct.unpack('I', read_data)[0]
+            code = (data >> 24) - 7
+            logger.debug('code: %r', code)
+            length = data & 0xffffff
+            logger.debug('len: %r', length)
             read_data = self._read_rsync_buff(length)
-            read_data = read_data.rstrip('\n\r')
-            logger.error('%s (%s)', read_data, code)
-            if code == 1 or read_data.rfind('file has vanished:'):
-                self.error_count = self.error_count + 1
+            if code == 0:
+                read_data = self.chunk_data.read(self.chunk_len) + read_data
+                self.chunk_len = self.chunk_len + length
+                self.chunk_data.close()
+                self.chunk_data = StringIO(read_data)
+                logger.debug('length of chunk_data: %r', len(read_data))
+                # print 'chunk_data: %r' % self.chunk_data
+            else:
+                read_data = read_data.rstrip('\n\r')
+                logger.error('%s (%s)', read_data, code)
+                if code == 1 or read_data.rfind('file has vanished:'):
+                    self.error_count = self.error_count + 1
 
     @classmethod
     def _from_wire_mode(cls, mode):
@@ -325,239 +360,275 @@ class FileList:
         else:
             return False
 
+    def _read_flags(self):
+        """read flags from buffer"""
+        self.flags = self._read_byte()
+        if self.protocol_version >= 28 and (self.flags & XMIT_EXTENDED_FLAGS):
+            self.flags = self.flags | (self._read_byte() << 8)
+        logger.debug('flags: %r', self.flags)
+
+    def _read_paths_len(self):
+        """read dir and file path from buffer"""
+        # get dir path length
+        if (self.flags & XMIT_SAME_NAME):
+            logger.debug('XMIT_SAME_NAME')
+            dir_len = self._read_byte()
+        else:
+            dir_len = 0
+        logger.debug('dir_len: %r', dir_len)
+
+        # get file path length
+        if (self.flags & XMIT_LONG_NAME):
+            file_path_len = self._read_int()
+            logger.debug('XMIT_LONG_NAME')
+        else:
+            file_path_len = self._read_byte()
+        logger.debug('file_path_len: %r', file_path_len)
+        return (dir_len, file_path_len)
+
+    def _read_file_path(self, dir_len, file_path_len):
+        """read dir and file path from buffer"""
+        thisname = self.lastname[:dir_len]
+        logger.debug('thisname: %r', thisname)
+
+        # get file name
+        read_data = self._read_buff(file_path_len)
+        logger.debug('read_data: %r', read_data)
+        thisname = thisname + self._clean_file_name(read_data)
+        logger.debug('clean thisname: %s', thisname)
+
+        self.lastname = thisname
+
+        if '/' in thisname:
+            basename = thisname[thisname.rfind('/') + 1:]
+            lastdir_len = len(self.lastdir)
+            dirname_len = len(thisname) - len(basename) - 1
+            # logger.debug('lastdir_len %r', lastdir_len)
+            # logger.debug('dirname_len %r', dirname_len)
+            # logger.debug('thisname[:lastdir_len] %r',
+            #              thisname[:dirname_len])
+            # logger.debug('self.lastdir %r', self.lastdir)
+            if lastdir_len == dirname_len \
+                    and self.lastdir == thisname[:dirname_len]:
+                dirname = self.lastdir
+            else:
+                dirname = thisname[:dirname_len]
+                self.lastdir = dirname
+        else:
+            basename = thisname
+            dirname = ''
+            self.lastdir = self.lastname
+        return dirname, basename
+
+    def _read_file_size(self):
+        """read file size from buffer"""
+        file_size = self._read_longint()
+        logger.debug('file size: %rB', file_size)
+        logger.debug('file size: %rMB', file_size / 1024 / 1024)
+        return file_size
+
+    def _read_mtime(self):
+        """read file mtime from buffer"""
+        if not (self.flags & XMIT_SAME_TIME):
+            mtime = self._read_int()
+            logger.debug('not XMIT_SAME_TIME')
+        else:
+            mtime = self.files[-1].mtime
+        logger.debug('mtime: %r', mtime)
+        return mtime
+
+    def _read_mode(self):
+        """read file mode from buffer"""
+        if not (self.flags & XMIT_SAME_MODE):
+            logger.debug('not XMIT_SAME_MODE')
+            mode = self._from_wire_mode(self._read_int())
+        else:
+            mode = self.files[-1].mode
+        logger.debug('mode: %r', mode)
+        return mode
+
+    def _read_uid(self):
+        """read uid from buffer"""
+        if self.preserve_uid and not (self.flags & XMIT_SAME_UID):
+            uid = self._read_int()
+        else:
+            uid = self.files[-1].uid
+        logger.debug('uid: %r', uid)
+        return uid
+
+    def _read_gid(self):
+        """read gid from buffer"""
+        if self.preserve_gid and not (self.flags & XMIT_SAME_GID):
+            gid = self._read_int()
+        else:
+            gid = self.files[-1].gid
+        logger.debug('gid: %r', gid)
+        return gid
+
+    def _read_link_len(self, mode):
+        """read link len from buffer"""
+        if self.preserve_links and stat.S_ISLNK(mode):
+            logger.debug('preserve_links and S_ISLNK')
+            linkname_length = self._read_int()
+            logger.debug('linkname_length: %r', linkname_length)
+            if linkname_length <= 0 or linkname_length > MAXPATHLEN:
+                logger.debug('overflow on symlink: linkname_length=%d\n',
+                             linkname_length)
+                self.fatal_error = True
+                return
+        else:
+            linkname_length = None
+        return linkname_length
+
+    def _read_device_pre28(self, mode):
+        """read device from buffer"""
+        if self._is_device(mode):
+            if not (self.flags & XMIT_SAME_RDEV_pre28):
+                rdev = self._read_int()
+            else:
+                rdev = self.files[-1].rdev
+            logger.debug('rdev: %r', rdev)
+        else:
+            rdev = os.makedev(0, 0)
+            logger.debug('rdev: %r', rdev)
+        return rdev
+
+    def _read_device(self):
+        """read device from buffer"""
+        if not (self.flags & XMIT_SAME_RDEV_MAJOR):
+            rdev_major = self._read_int()
+        else:
+            rdev_major = self.files[-1].rdev_major
+        logger.debug('rdev_major: %r', rdev_major)
+
+        if self.flags & XMIT_RDEV_MINOR_IS_SMALL:
+            rdev_minor = self._read_byte()
+        else:
+            rdev_minor = self._read_int()
+        logger.debug('rdev_minor: %r', rdev_minor)
+        return rdev_major, rdev_minor
+
+    def _read_hardlink(self):
+        """read hardlink from buffer"""
+        if self.protocol_version < 26:
+            dev = self._read_int()
+            logger.debug('dev: %r', dev)
+            inode = self._read_int()
+            logger.debug('inode: %r', inode)
+        else:
+            if self.flags & XMIT_SAME_DEV:
+                dev = self.files[-1].dev
+            else:
+                dev = self._read_longint()
+                logger.debug('dev: %r', dev)
+            inode = self._read_longint()
+            logger.debug('inode: %r', inode)
+        return (dev, inode)
+
+    def _read_checksum(self, mode):
+        """read checksum from buffer"""
+        if not stat.S_ISREG(mode):
+            logger.debug('checksum of non regular file')
+            checksum = None
+        elif self.protocol_version < 21:
+            logger.debug('checksum of regular file < 21')
+            checksum = self._read_buff(2)
+        else:
+            logger.debug('checksum of regular file < 28')
+            checksum = self._read_buff(MD4_SUM_LENGTH)
+        logger.debug('checksum: %r', checksum)
+        return checksum
+
+    def _get_file_entry(self):
+        """get a file entry from buffer"""
+        #### get entry
+        logger.debug('*****   START OF FILE   *****')
+        file_entry = File()
+
+        # read paths len
+        dir_len, file_path_len = self._read_paths_len()
+
+        # read file and dir name
+        file_entry.dirname, file_entry.basename = self.\
+            _read_file_path(dir_len, file_path_len)
+
+        # get file size
+        file_entry.size = self._read_file_size()
+
+        # get file mtime
+        file_entry.mtime = self._read_mtime()
+
+        # get file mode
+        file_entry.mode = self._read_mode()
+
+        # get file uid
+        file_entry.uid = self._read_uid()
+
+        # get file gid
+        file_entry.gid = self._read_gid()
+
+        if self.preserve_devices:
+            if self.protocol_version < 28:
+                logger.debug('protocol_version < 28')
+                file_entry.rdev = self._read_device_pre28(file_entry.mode)
+            elif self._is_device(file_entry.mode):
+                logger.debug('is a device!')
+                file_entry.rdev_major, file_entry.rdev_minor = self.\
+                    _read_device()
+                file_entry.rdev = os.makedev(file_entry.rdev_major,
+                                             file_entry.rdev_minor)
+                logger.debug('rdev: %r', file_entry.rdev)
+
+        # read link length
+        linkname_length = self._read_link_len(file_entry.mode)
+
+        if self.flags & XMIT_TOP_DIR:
+            file_entry.flags = self.flags & FLAG_TOP_DIR
+        else:
+            file_entry.flags = self.flags & 0
+
+        if linkname_length is not None:
+            file_entry.link = self._read_buff(linkname_length)
+            logger.debug('link: %r', file_entry.link)
+        #     if (f->sanitize_paths)
+        #         sanitize_path(bp, bp, "", lastdir_depth);
+        #     bp += linkname_length;
+        # }
+
+        if self.preserve_hard_links and self.protocol_version < 28 \
+                and stat.S_ISREG(file_entry.mode):
+            self.flags = self.flags | XMIT_HAS_IDEV_DATA
+
+        # read hardlink
+        if self.flags & XMIT_HAS_IDEV_DATA:
+            logger.debug('XMIT_HAS_IDEV_DATA')
+            file_entry.dev, file_entry.inode = self._read_hardlink()
+
+        # read checksum
+        if self.always_checksum:
+            file_entry.checksum = self._read_checksum(file_entry.mode)
+
+        if file_entry.dirname == '':
+            file_entry.name = file_entry.basename
+        else:
+            file_entry.name = file_entry.dirname + '/' + \
+                file_entry.basename
+
+        self.files.append(file_entry)
+        logger.debug('*****   END OF FILE - %r   *****', file_entry.name)
+
     def recieve(self):
         """recevie file list"""
         # get entries
 
         # get flags
-        flags = self._read_flags()
-        while flags:
-            #### get entry
-            logger.debug('*****   START OF FILE   *****')
-            file_entry = File()
-
-            # get file path
-            if (flags & XMIT_SAME_NAME):
-                logger.debug('XMIT_SAME_NAME')
-                path_len = self._read_byte()
-            else:
-                path_len = 0
-            logger.debug('path_len: %r', path_len)
-
-            # get file path length
-            if (flags & XMIT_LONG_NAME):
-                file_path_length = self._read_int()
-                logger.debug('XMIT_LONG_NAME')
-            else:
-                file_path_length = self._read_byte()
-            logger.debug('file_path_length: %r', file_path_length)
-
-            thisname = self.lastname[:path_len]
-            logger.debug('thisname: %r', thisname)
-            # get file name
-            read_data = self._read_buff(file_path_length)
-            logger.debug('read_data: %r', read_data)
-            thisname = thisname + self._clean_file_name(read_data)
-            logger.debug('clean thisname: %s', thisname)
-
-            self.lastname = thisname
-
-            if '/' in thisname:
-                logger.debug('/ in thisname')
-                file_entry.basename = thisname[thisname.rfind('/') + 1:]
-                lastdir_len = len(self.lastdir)
-                dirname_len = len(thisname) - len(file_entry.basename) - 1
-                logger.debug('lastdir_len %r', lastdir_len)
-                logger.debug('dirname_len %r', dirname_len)
-                logger.debug('thisname[:lastdir_len] %r',
-                             thisname[:dirname_len])
-                logger.debug('self.lastdir %r', self.lastdir)
-                if lastdir_len == dirname_len \
-                        and self.lastdir == thisname[:dirname_len]:
-                    logger.debug('equal dir !!!!')
-                    file_entry.dirname = self.lastdir
-                else:
-                    file_entry.dirname = thisname[:dirname_len]
-                    self.lastdir = file_entry.dirname
-            else:
-                file_entry.basename = thisname
-                file_entry.dirname = ''
-                self.lastdir = self.lastname
-
-            logger.debug('new dirname: %r', file_entry.dirname)
-            logger.debug('new basename: %r', file_entry.basename)
-
-    # if ((basename = strrchr(thisname, '/')) != NULL) {
-    #     dirname_len = ++basename - thisname; /* counts future '\0' */
-    #     if (lastdir_len == dirname_len - 1
-    #         && strncmp(thisname, lastdir, lastdir_len) == 0) {
-    #             dirname = lastdir;
-    #             dirname_len = 0; /* indicates no copy is needed */
-    #     } else
-    #             dirname = thisname;
-    # } else {
-    #     basename = thisname;
-    #     dirname = NULL;
-    #     dirname_len = 0;
-    # }
-    # basename_len = strlen(basename) + 1; /* count the '\0' */
-
-    # if (dirname_len) {
-    #     file->dirname = lastdir = bp;
-    #     lastdir_len = dirname_len - 1;
-    #     memcpy(bp, dirname, dirname_len - 1);
-    #     bp += dirname_len;
-    #     bp[-1] = '\0';
-    #     if (f->sanitize_paths)
-    #         lastdir_depth = count_dir_elements(lastdir);
-    # } else if (dirname) {
-    #     file->dirname = dirname;
-    # }
-
-    # file->basename = bp;
-    # memcpy(bp, basename, basename_len);
-    # bp += basename_len;
-
-            # get file size
-            file_entry.size = self._read_longint()
-            logger.debug('file size: %rB', file_entry.size)
-            logger.debug('file size: %rMB', file_entry.size / 1024 / 1024)
-
-            # get file mtime
-            if not (flags & XMIT_SAME_TIME):
-                file_entry.mtime = self._read_int()
-                logger.debug('not XMIT_SAME_TIME')
-            else:
-                file_entry.mtime = self.files[-1].mtime
-            logger.debug('mtime: %r', file_entry.mtime)
-
-            # get file mode
-            if not (flags & XMIT_SAME_MODE):
-                logger.debug('not XMIT_SAME_MODE')
-                file_entry.mode = self._from_wire_mode(self._read_int())
-            else:
-                file_entry.mode = self.files[-1].mode
-            logger.debug('mode: %r', file_entry.mode)
-
-            # get file uid
-            if self.preserve_uid and not (flags & XMIT_SAME_UID):
-                file_entry.uid = self._read_int()
-            else:
-                file_entry.uid = self.files[-1].uid
-            logger.debug('uid: %r', file_entry.uid)
-
-            # get file gid
-            if self.preserve_gid and not (flags & XMIT_SAME_GID):
-                file_entry.gid = self._read_int()
-            else:
-                file_entry.gid = self.files[-1].gid
-            logger.debug('gid: %r', file_entry.gid)
-
-            if self.preserve_devices:
-                if self.protocol_version < 28:
-                    logger.debug('protocol_version < 28')
-                    if self._is_device(file_entry.mode):
-                        if not (flags & XMIT_SAME_RDEV_pre28):
-                            rdev = self._read_int()
-                            logger.debug('rdev: %r', rdev)
-                    else:
-                        rdev = os.makedev(0, 0)
-                        logger.debug('rdev: %r', rdev)
-                elif self._is_device(file_entry.mode):
-                    logger.debug('is a device!')
-                    if not (flags & XMIT_SAME_RDEV_MAJOR):
-                        rdev_major = self._read_int()
-                        logger.debug('rdev_major: %r', rdev_major)
-                    if flags & XMIT_RDEV_MINOR_IS_SMALL:
-                        rdev_minor = self._read_byte()
-                        logger.debug('rdev_minor: %r', rdev_minor)
-                    else:
-                        rdev_minor = self._read_int()
-                        logger.debug('rdev_minor: %r', rdev_minor)
-                    rdev = os.makedev(rdev_major, rdev_minor)
-                    logger.debug('rdev: %r', rdev)
-
-            if self.preserve_links and stat.S_ISLNK(file_entry.mode):
-                logger.debug('preserve_links and S_ISLNK')
-                linkname_length = self._read_int()
-                logger.debug('linkname_length: %r', linkname_length)
-                if linkname_length <= 0 or linkname_length > MAXPATHLEN:
-                    logger.debug('overflow on symlink: linkname_length=%d\n',
-                                 linkname_length)
-                    self.fatal_error = True
-                    return
-            else:
-                linkname_length = None
-
-            if self.always_checksum and stat.S_ISREG(file_entry.mode):
-                sum_len = MD4_SUM_LENGTH
-            else:
-                sum_len = 0
-
-            if flags & XMIT_TOP_DIR:
-                file_entry.flags = FLAG_TOP_DIR
-            else:
-                file_entry.flags = 0
-
-            if self.preserve_devices and self._is_device(file_entry.mode):
-                file_entry.rdev = rdev
-
-            if linkname_length is not None:
-                file_entry.link = self._read_buff(linkname_length)
-                logger.debug('link: %r', file_entry.link)
-            #     if (f->sanitize_paths)
-            #         sanitize_path(bp, bp, "", lastdir_depth);
-            #     bp += linkname_length;
-            # }
-
-            if self.preserve_hard_links and self.protocol_version < 28 \
-                    and stat.S_ISREG(file_entry.mode):
-                flags = flags or XMIT_HAS_IDEV_DATA
-            if flags & XMIT_HAS_IDEV_DATA:
-                logger.debug('XMIT_HAS_IDEV_DATA')
-                if self.protocol_version < 26:
-                    dev = self._read_int()
-                    logger.debug('dev: %r', dev)
-                    inode = self._read_int()
-                    logger.debug('inode: %r', inode)
-                else:
-                    if not (flags & XMIT_SAME_DEV):
-                        dev = self._read_longint()
-                        logger.debug('dev: %r', dev)
-                    inode = self._read_longint()
-                    logger.debug('inode: %r', inode)
-
-                if self.preserve_hard_links:
-                    file_entry.inode = inode
-                    file_entry.dev = dev
-
-            # if self.always_checksum:
-            #     char *sum;
-            #     if sum_len == 0:
-            #         file->u.sum = sum = bp;
-            #         /*bp += sum_len;*/
-            #     } else if (f->protocol_version < 28) {
-            #         /* Prior to 28, we get a useless set of nulls. */
-            #         sum = empty_sum;
-            #     } else
-            #         sum = NULL;
-            #     if (sum) {
-            #         read_buf(f, sum, f->protocol_version < 21 ? 2 : MD4_SUM_LENGTH);
-            #     }
-            # }
-
-            if file_entry.dirname == '':
-                file_entry.name = file_entry.basename
-            else:
-                file_entry.name = file_entry.dirname + '/' + \
-                    file_entry.basename
-
-            self.files.append(file_entry)
-
-            logger.debug('*****   END OF FILE - %r   *****', file_entry.name)
+        self._read_flags()
+        while self.flags:
+            # get file entry for each flags
+            self._get_file_entry()
 
             # get next flags
-            flags = self._read_flags()
+            self._read_flags()
 
 
 class File:
@@ -573,7 +644,10 @@ class File:
     dev = None      # device number on which file resides
     inode = None    # file inode
     link = None     # link contents if the file is a sym link
+    rdev_major = 0     # major device number if file is char/block special
+    rdev_minor = 0     # minor device number if file is char/block special
     rdev = None     # major/minor device number if file is char/block special
+    checksum = None
 
     flags = 0
 
@@ -587,7 +661,7 @@ if __name__ == "__main__":
     # print resource.getrusage(resource.RUSAGE_SELF)
     rsyncp = RsyncP()
     rsyncp.remote_start()
-    rsyncp.received_file_list()
-    # cProfile.run('rsyncp.received_file_list()')
+    rsyncp.sync()
+    # cProfile.run('rsyncp.sync()')
     rsyncp.terminate()
     # print resource.getrusage(resource.RUSAGE_SELF)
